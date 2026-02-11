@@ -1,0 +1,131 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────
+# LuminaLib — One-command start:
+#   docker-compose up --build
+#
+# With real LLM (Ollama):
+#   docker-compose --profile llm up --build
+#
+# With S3 storage (MinIO):
+#   docker-compose --profile s3 up --build
+# ─────────────────────────────────────────────────────────────────
+
+x-common-env: &common-env
+  env_file:
+    - .env
+
+services:
+  # ── Core API ───────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    <<: *common-env
+    volumes:
+      - book_storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - luminalib-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting API server...' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+      "
+
+  # ── Database ───────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-luminalib}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-luminalib_secret}
+      POSTGRES_DB: ${DB_NAME:-luminalib}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - luminalib-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-luminalib} -d ${DB_NAME:-luminalib}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Local LLM (Ollama) ────────────────────────────
+  # Activated with: docker-compose --profile llm up
+  # Set LLM_PROVIDER=ollama in .env before using
+  ollama:
+    image: ollama/ollama:latest
+    profiles:
+      - llm
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    environment:
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+    networks:
+      - luminalib-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── S3-Compatible Storage (MinIO) ─────────────────
+  # Activated with: docker-compose --profile s3 up
+  # Set STORAGE_BACKEND=s3 in .env before using
+  minio:
+    image: minio/minio:latest
+    profiles:
+      - s3
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - luminalib-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+networks:
+  luminalib-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    driver: local
+  book_storage:
+    driver: local
+  ollama_data:
+    driver: local
+  minio_data:
+    driver: local
